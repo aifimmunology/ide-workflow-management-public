@@ -1,0 +1,229 @@
+##############################################################################
+# Workflow 2: ide-health-route
+#
+#   - StatefulSet + pod readiness waits
+#   - Node labeling for billing attribution (account, analyst, etc.)
+#   - GCE VM label propagation for cost accounting
+#   - IAP-authenticated health probe via gcloud identity token
+##############################################################################
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: ide-health-route-
+spec:
+  entrypoint: create
+  arguments:
+    parameters:
+      - name: podName
+      - name: ideName
+      - name: ideId
+      - name: ideBaseURI
+      - name: authClientID
+      - name: authSecretName
+      - name: includeDashApp
+      - name: project
+      - name: podTimeout
+  volumes:
+    - name: application-credentials
+      secret:
+        secretName: ide-management-service-account-credentials
+        items:
+          - key: sa_json
+            path: sa_credentials.json
+  templates:
+    - name: create
+      inputs:
+        parameters:
+          - name: podName
+          - name: ideName
+          - name: ideId
+          - name: ideBaseURI
+          - name: authClientID
+          - name: authSecretName
+          - name: includeDashApp
+          - name: project
+          - name: podTimeout
+      steps:
+        # ================================================================
+        # STEP 1: Wait for StatefulSet + pod to be Ready
+        # Init container hydration must complete before the pod goes Ready,
+        # so by the time we pass this gate, all PVCs are hydrated.
+        # ================================================================
+        - - name: stateful-set
+            template: wait-stateful-set
+        - - name: running-pod
+            template: wait-for-running-pod
+
+        # ================================================================
+        # STEP 2: Health probe + node labeling in parallel
+        # Networking was pre-created in workflow 1, so the LB path is
+        # usually warm by now. Health probe typically succeeds within
+        # a few seconds.
+        # ================================================================
+        - - name: check-status
+            template: check-status
+          - name: label-node
+            template: label-node
+
+        # ================================================================
+        # STEP 3: Propagate labels to GCE VM for billing
+        # ================================================================
+        - - name: label-node-vm
+            template: label-node-vm
+            arguments:
+              parameters:
+              - name: node-name
+                value: "{{steps.label-node.outputs.parameters.node-name}}"
+              - name: node-zone
+                value: "{{steps.label-node.outputs.parameters.node-zone}}"
+              - name: labels-and-values
+                value: "{{steps.label-node.outputs.parameters.labels-and-values}}"
+
+    - name: wait-stateful-set
+      resource:
+        action: get
+        successCondition: status.readyReplicas == 1
+        manifest: |
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: {{workflow.parameters.ideName}}
+
+    - name: wait-for-running-pod
+      activeDeadlineSeconds: "{{workflow.parameters.podTimeout}}"
+      resource:
+        action: get
+        successCondition: status.phase == Running
+        manifest: |
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: {{workflow.parameters.podName}}
+
+    - name: check-status
+      script:
+        image: google/cloud-sdk:502.0.0-alpine
+        command: [bash]
+        source: |
+          gcloud auth activate-service-account --key-file /etc/gcp/sa_credentials.json
+
+          BASE_URI={{workflow.parameters.ideBaseURI}}
+          IDE_NAME={{workflow.parameters.ideName}}
+          AUTH_CLIENT_ID={{workflow.parameters.authClientID}}
+          TIMEOUT=600  # 10 min ceiling
+          ELAPSED=0
+          SLEEP=1       # Start with 1s poll
+
+          while true; do
+            READY=$(curl -s -H "Authorization: Bearer $(gcloud auth print-identity-token --audiences=$AUTH_CLIENT_ID)" \
+              https://$BASE_URI/$IDE_NAME/lab | grep -q "JupyterLab" && echo "true" || echo "false")
+            echo "IDE ready: $READY (${ELAPSED}s, next poll in ${SLEEP}s)"
+
+            if [[ "$READY" == "true" ]]; then
+              echo "Health check passed for $IDE_NAME in ${ELAPSED}s"
+              exit 0
+            fi
+
+            sleep $SLEEP
+            ELAPSED=$((ELAPSED + SLEEP))
+
+            # Exponential backoff capped at 5s:
+            # 1, 2, 4, 5, 5, 5, ...
+            if [ "$SLEEP" -lt 5 ]; then
+              SLEEP=$((SLEEP * 2))
+              if [ "$SLEEP" -gt 5 ]; then
+                SLEEP=5
+              fi
+            fi
+
+            if [ "$ELAPSED" -ge "$TIMEOUT" ]; then
+              echo "Timeout reached for $IDE_NAME"
+              exit 1
+            fi
+          done
+        resources:
+          limits:
+            memory: 2Gi
+            cpu: "1000m"
+          requests:
+            memory: 2Gi
+            cpu: "1000m"
+        volumeMounts:
+          - name: application-credentials
+            mountPath: "/etc/gcp"
+            readOnly: true
+
+    - name: label-node
+      outputs:
+        parameters:
+        - name: node-name
+          valueFrom:
+            path: /tmp/node-name.txt
+        - name: node-zone
+          valueFrom:
+            path: /tmp/node-zone.txt
+        - name: labels-and-values
+          valueFrom:
+            path: /tmp/labels-and-values.txt
+      script:
+        image: alpine/k8s:1.28.13
+        command: [bash]
+        source: |
+          POD_NAME="{{workflow.parameters.podName}}"
+          NAMESPACE="default"
+
+          NODE_NAME=$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.spec.nodeName}')
+          NODE_ZONE=$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o jsonpath='{.metadata.labels.topology\.kubernetes\.io/zone}')
+          echo "Pod is running on node $NODE_NAME in zone $NODE_ZONE"
+          mkdir -p /tmp
+          echo $NODE_NAME > /tmp/node-name.txt
+          echo $NODE_ZONE > /tmp/node-zone.txt
+
+          LABEL_KEYS="account analyst billing-category project instance organization partner science-program science-project"
+          POD_LABELS=$(kubectl get pod "$POD_NAME" -n "$NAMESPACE" -o json)
+          LABELS_AND_VALUES=""
+
+          for key in $LABEL_KEYS; do
+            value=$(echo "$POD_LABELS" | jq -r ".metadata.labels[\"$key\"]")
+            if [[ "$key" == "billing-category" ]]; then
+              kubectl label node "$NODE_NAME" "$key=ide" --overwrite
+              LABELS_AND_VALUES="$LABELS_AND_VALUES$key=ide,"
+              continue
+            fi
+            if [[ -z "$value" || "$value" == "null" ]]; then continue; fi
+            existing=$(kubectl get node "$NODE_NAME" -o jsonpath="{.metadata.labels.$key}")
+            if [[ "$existing" != "$value" && "$value" != "null" ]]; then
+              key=$(echo "$key" | tr '[:upper:]' '[:lower:]' | tr '._' '-' | cut -c -63)
+              value_clean=$(echo "$value" | tr ' ' '-' | cut -c -63)
+              kubectl label node "$NODE_NAME" "$key=$value_clean" --overwrite
+            fi
+            value=$(echo "$value" | tr '[:upper:]' '[:lower:]')
+            LABELS_AND_VALUES="$LABELS_AND_VALUES$key=$value,"
+          done
+
+          if [ -n "$LABELS_AND_VALUES" ]; then
+            LABELS_AND_VALUES="${LABELS_AND_VALUES%,}"
+          fi
+          echo $LABELS_AND_VALUES > /tmp/labels-and-values.txt
+
+    - name: label-node-vm
+      inputs:
+        parameters:
+        - name: node-name
+        - name: node-zone
+        - name: labels-and-values
+      script:
+        image: google/cloud-sdk:502.0.0-alpine
+        command: [bash]
+        source: |
+          gcloud auth activate-service-account --key-file /etc/gcp/sa_credentials.json
+          PROJECT="{{workflow.parameters.project}}"
+          NODE_NAME={{inputs.parameters.node-name}}
+          NODE_ZONE={{inputs.parameters.node-zone}}
+          LABELS_AND_VALUES={{inputs.parameters.labels-and-values}}
+          echo "Labeling VM $NODE_NAME in $NODE_ZONE with: $LABELS_AND_VALUES"
+          gcloud compute instances update $NODE_NAME --zone $NODE_ZONE --update-labels=$LABELS_AND_VALUES --project $PROJECT
+        volumeMounts:
+          - name: application-credentials
+            mountPath: "/etc/gcp"
+            readOnly: true

@@ -1,0 +1,47 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: bad-state-cron-
+spec:
+  serviceAccountName: dev-ide-management-sa
+  entrypoint: cron-entrypoint
+  templates:
+  - name: cron-entrypoint
+    steps:
+    - - name: handle-pods
+        template: handle-pods
+
+
+  - name: handle-pods
+    outputs:
+      parameters:
+        - name: bad-pods
+          valueFrom:
+            path: /tmp/pods.txt
+    script:
+      image: alpine/k8s:1.28.13
+      command: [bash]
+      source: |
+        mkdir -p /tmp
+        touch /tmp/pods.txt
+
+        # format of each entry is: "instance,analyst,status;"
+
+        # Check for pods that have been previously terminated. Includes CrashLoopBackOff and OOMKilled
+        for pod in $(kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+            terminationReason=$(kubectl get pod "$pod" -o jsonpath='{range .status.containerStatuses[*]}{.lastState.terminated.reason}{"\n"}{end}')
+            
+            if [[ -n "$terminationReason" ]]; then
+                echo "Pod $pod has lastState.terminated.reason: $terminationReason"
+                
+                POD_IS_RUNNING=$(kubectl get po --field-selector=status.phase=Running --no-headers -o custom-columns=":metadata.name" | grep "$pod")
+                if [[ "$POD_IS_RUNNING" == "" ]]; then
+                    echo "Pod $pod is NOT running, adding to bad state pod list"
+                    kubectl get pod "$pod" -o jsonpath='{.metadata.labels.instance},{range .status.containerStatuses[*]}{.lastState.terminated.reason};{end}' >> /tmp/pods.txt
+                else
+                    echo "Pod $pod is running, ignoring"
+                fi  
+            fi
+        done
+
+        echo -e "Pods in bad states:\n$(cat /tmp/pods.txt)"

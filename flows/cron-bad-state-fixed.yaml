@@ -1,0 +1,49 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: bad-state-fixed-cron-
+spec:
+  serviceAccountName: dev-ide-management-sa
+  entrypoint: main
+  arguments:
+    parameters:
+      - name: podList
+  templates:
+    - name: main
+      steps:
+        - - name: check-pod
+            template: check-pod
+
+    - name: check-pod
+      outputs:
+          parameters:
+            - name: running_pods
+              valueFrom:
+                path: /tmp/pods.txt
+      script:
+        image: alpine/k8s:1.28.13
+        command: [bash]
+        source: |
+          mkdir -p /tmp
+          touch /tmp/pods.txt
+
+          # convert the input string (format is "pod1,pod2,pod3") to an array
+          POD_LIST=$(echo {{workflow.parameters.podList}})
+          IFS=', ' read -r -a POD_ARRAY <<< "$POD_LIST"
+
+          # check the status of each "bad state" pod, if it's now running add it to output params list
+          for POD_NAME in "${POD_ARRAY[@]}"
+          do
+            POD_IS_RUNNING=$(kubectl get po --field-selector=status.phase=Running --no-headers -o custom-columns=":metadata.name" | grep "$POD_NAME")
+            if [[ "$POD_IS_RUNNING" == "" ]]; then
+                echo "Pod $POD_NAME is NOT running"
+            else
+                echo "Pod $POD_NAME is running, adding to output list"
+                echo -ne "$POD_NAME," >> /tmp/pods.txt
+            fi
+          done
+
+          echo "Pods now running: $(cat /tmp/pods.txt)"
+
+          
+

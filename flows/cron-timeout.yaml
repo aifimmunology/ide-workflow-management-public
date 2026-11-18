@@ -1,0 +1,39 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: timeout-cron-
+spec:
+  serviceAccountName: dev-ide-management-sa
+  entrypoint: cron-entrypoint
+  templates:
+  - name: cron-entrypoint
+    steps:
+    - - name: handle-pods
+        template: handle-pods
+
+
+  - name: handle-pods
+    outputs:
+      parameters:
+        - name: pods
+          valueFrom:
+            path: /tmp/pods.txt
+    script:
+      image: alpine/k8s:1.28.13
+      command: [bash]
+      source: |
+        mkdir -p /tmp
+        touch /tmp/pods.txt
+
+        # format of each entry is: "instance,started,terminated;"
+
+        for pod in $(kubectl get pods -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}'); do
+            terminationReason=$(kubectl get pod "$pod" -o jsonpath='{range .status.containerStatuses[*]}{.lastState.terminated.reason}{"\n"}{end}')
+
+            if [[ "$terminationReason" == "Completed" ]]; then
+              echo "Pod $pod has lastState.terminated.reason: $terminationReason"
+              kubectl get pod $pod -o jsonpath='{.metadata.labels.instance};' >> /tmp/pods.txt
+            fi
+        done
+
+        echo "Pods that timed out: $(cat /tmp/pods.txt)"

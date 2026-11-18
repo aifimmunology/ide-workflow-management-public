@@ -1,0 +1,238 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: set-iam-policy-
+spec:
+  entrypoint: setiam
+  arguments:
+    parameters:
+      - name: userEmail
+      - name: serviceAccountEmail
+      - name: podName
+      - name: projectId
+      - name: ideUrl
+  volumes:
+    - name: application-credentials
+      secret:
+        secretName: ide-management-service-account-credentials
+        items:
+          - key: sa_json
+            path: sa_credentials.json
+  templates: 
+  - name: setiam
+    inputs:
+        parameters:
+           - name: userEmail
+           - name: serviceAccountEmail
+           - name: podName
+           - name: projectId
+           - name: ideUrl
+    steps:
+      - - name: getting-network-endpoint-group-name
+          template: getting-network-endpoint-group-name
+      - - name: setting-iam-policy
+          template: setting-iam-policy
+          arguments:
+            parameters:
+            - name: network-endpoint-group
+              value: "{{steps.getting-network-endpoint-group-name.outputs.parameters.network-endpoint-group}}"
+      - - name: checking-iam-policy
+          template: checking-iam-policy
+          arguments:
+            parameters:
+            - name: backend-service
+              value: "{{steps.setting-iam-policy.outputs.parameters.backend-service}}"
+      - - name: checking-http-status
+          template: checking-http-status
+          arguments:
+            parameters:
+            - name: backend-service
+              value: "{{steps.setting-iam-policy.outputs.parameters.backend-service}}"
+
+
+  - name: getting-network-endpoint-group-name
+    retryStrategy:
+      limit: "10"
+      backoff:
+        duration: "1" # Default is seconds. Can also be a duration, e.g.: "2m", "6h"
+        factor: "2"
+        maxDuration: "5m"
+    outputs:
+      parameters:
+      - name: network-endpoint-group
+        valueFrom:
+          path: /tmp/network-endpoint-group.txt 
+    script:
+      image: alpine/k8s:1.28.13
+      command: [bash]
+      source: |
+        set -x
+
+        POD_NAME={{workflow.parameters.podName}}
+        NEG=$(
+          kubectl get service $POD_NAME -o json \
+          | jq -r '
+            .metadata.annotations
+            | (.["cloud.google.com/neg"]         | fromjson | .exposed_ports | keys[0]) as $port
+            | (.["cloud.google.com/neg-status"]  | fromjson | .network_endpoint_groups[$port])
+          ')
+
+        # save the NEG name so it can be passed to the next step
+        mkdir -p /tmp
+        echo $NEG > /tmp/network-endpoint-group.txt
+
+
+  - name: setting-iam-policy
+    retryStrategy:
+      limit: "10"
+      backoff:
+        duration: "1" # Default is seconds. Can also be a duration, e.g.: "2m", "6h"
+        factor: "2"
+        maxDuration: "5m"
+    inputs:
+      parameters:
+      - name: network-endpoint-group
+        value: "{{steps.getting-network-endpoint-group-name.outputs.parameters.network-endpoint-group}}"
+    outputs:
+      parameters:
+      - name: backend-service
+        valueFrom:
+          path: /tmp/backend-service.txt 
+    script:
+      image: google/cloud-sdk:alpine
+      command: [bash]
+      source: |
+        set -x
+
+        echo '{' >> policy.json
+        echo '"version": 3,'  >> policy.json
+      
+        echo '"bindings": [ ' >> policy.json
+        echo '   {   "role": "roles/iap.httpsResourceAccessor", ' >> policy.json
+        echo '      "members": [ ' >> policy.json
+        echo '         "serviceAccount:{{workflow.parameters.serviceAccountEmail}}", ' >> policy.json
+        echo '        "user:{{workflow.parameters.userEmail}}"' >> policy.json
+        echo '   ] ' >> policy.json
+        echo '} ' >> policy.json
+        echo '] ' >> policy.json
+        echo '} ' >> policy.json
+       
+        cat policy.json
+        gcloud auth activate-service-account --key-file /etc/gcp/sa_credentials.json
+
+        PROJECT_ID={{workflow.parameters.projectId}}
+        NEG={{inputs.parameters.network-endpoint-group}}
+
+        BACKEND_SERVICE=$(gcloud compute backend-services list \
+          --project "$PROJECT_ID" \
+          --filter="backends.group:$NEG" \
+          --format="value(name)" \
+          | head -n 1)
+
+        echo "Backend Service: $BACKEND_SERVICE"
+
+        gcloud iap web set-iam-policy policy.json --resource-type=backend-services --service=$BACKEND_SERVICE
+        # example of backend service is "gkegw1-foc0-default-jan23-ide-ingress-8080-e5eq753inxu1"
+
+        # save the service name so it can be passed to the next step
+        mkdir -p /tmp
+        echo $BACKEND_SERVICE > /tmp/backend-service.txt
+      volumeMounts:
+        - name: application-credentials
+          mountPath: "/etc/gcp"
+          readOnly: true
+      
+  
+  - name: checking-iam-policy
+    retryStrategy:
+      limit: "12"
+      backoff:
+        duration: "5s"
+        factor: "2"
+        maxDuration: "2m"
+    inputs:
+      parameters:
+      - name: backend-service
+        value: "{{steps.setting-iam-policy.outputs.parameters.backend-service}}"
+    script:
+      image: google/cloud-sdk:alpine
+      command: [bash]
+      source: |
+        gcloud auth activate-service-account --key-file /etc/gcp/sa_credentials.json
+        
+        BACKEND_SERVICE={{inputs.parameters.backend-service}}
+        USER_EMAIL={{workflow.parameters.userEmail}}
+
+        FOUND=$(gcloud iap web get-iam-policy \
+          --resource-type=backend-services \
+          --service="$BACKEND_SERVICE" \
+          --flatten="bindings[].members" \
+          --filter="bindings.members:user:$USER_EMAIL" \
+          --format="value(bindings.members)")
+
+        if [[ -n "$FOUND" ]]; then
+          echo "$USER_EMAIL is in the ingress IAP policy"
+          exit 0
+        else
+          echo "$USER_EMAIL is NOT in the ingress IAP policy"
+          exit 1
+        fi
+      volumeMounts:
+        - name: application-credentials
+          mountPath: "/etc/gcp"
+          readOnly: true
+
+
+  - name: checking-http-status
+    retryStrategy:
+      limit: "12"
+      backoff:
+        duration: "5s"
+        factor: "2"
+        maxDuration: "2m"
+    inputs:
+      parameters:
+      - name: backend-service
+        value: "{{steps.setting-iam-policy.outputs.parameters.backend-service}}"
+    script:
+      image: google/cloud-sdk:alpine
+      command: [bash]
+      source: |
+        gcloud auth activate-service-account --key-file /etc/gcp/sa_credentials.json
+        
+        BACKEND_SERVICE={{inputs.parameters.backend-service}}
+
+        IDE_URL="{{workflow.parameters.ideUrl}}"
+        CLIENT_ID=$(gcloud compute backend-services describe "$BACKEND_SERVICE" --format="value(iap.oauth2ClientId)" --global)
+
+        TOKEN=$(gcloud auth print-identity-token \
+          --audiences="$CLIENT_ID")
+
+        HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+          -H "Authorization: Bearer $TOKEN" \
+          "$IDE_URL")
+
+        echo "HTTP status: $HTTP_STATUS"
+
+        case "$HTTP_STATUS" in
+          200)
+            echo "Access ready"
+            exit 0
+            ;;
+          403)
+            echo "IAP denying access (policy not propagated yet)"
+            exit 1
+            ;;
+          401)
+            echo "Auth issue (token invalid)"
+            exit 1
+            ;;
+          *)
+            echo "Unexpected response"
+            exit 1
+            ;;
+        esac
+      volumeMounts:
+        - name: application-credentials
+          mountPath: "/etc/gcp"
+          readOnly: true

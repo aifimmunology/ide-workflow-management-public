@@ -1,0 +1,46 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: temp-user-disk-cron-
+spec:
+  serviceAccountName: dev-ide-management-sa
+  entrypoint: main
+  arguments:
+    parameters:
+      - name: defaultSizeGb
+  templates:
+    - name: main
+      steps:
+        - - name: check-user-disks
+            template: check-user-disks
+
+    - name: check-user-disks
+      outputs:
+          parameters:
+            - name: user_disks
+              valueFrom:
+                path: /tmp/userdisks.txt
+      script:
+        image: alpine/k8s:1.28.13
+        command: [bash]
+        source: |
+          mkdir -p /tmp
+          touch /tmp/userdisks.txt
+
+          DEFAULT_SIZE_GB={{workflow.parameters.defaultSizeGb}}
+
+          # get all pvcs that have a size greater than the default size
+          kubectl get pvc -o json | jq -r '
+            .items[] 
+            | select(.metadata.name | contains("userdisk")) 
+            | select(.spec.resources.requests.storage | sub("Gi"; "") | tonumber > '$DEFAULT_SIZE_GB') 
+            | .metadata.name
+          ' >> /tmp/userdisks.txt
+          
+          # create a string that looks like: "userdisk-1;userdisk-2;userdisk-3"
+          FORMATTED=$(paste -sd';' /tmp/userdisks.txt)
+
+          # overwrite previous line by line style with formatted string
+          echo $FORMATTED > /tmp/userdisks.txt
+
+          echo "Expanded User Disks: $(cat /tmp/userdisks.txt)"

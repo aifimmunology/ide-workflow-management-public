@@ -1,0 +1,30 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: describe-pod-
+spec:
+  entrypoint: main
+  arguments:
+    parameters:
+      - name: pod_name
+  templates:
+    - name: main
+      steps:
+        - - name: logs
+            template: logs
+
+    - name: logs
+      outputs:
+          parameters:
+            - name: pod_events
+              valueFrom:
+                path: /apps/events.log
+      script:
+        image: alpine/k8s:1.28.13
+        command: [bash]
+        source: |
+          # get the pod's events for debugging
+          touch events.log
+          kubectl events --for pod/{{workflow.parameters.pod_name}} >> events.log
+          echo "Events for {{workflow.parameters.pod_name}}: $(cat events.log)"
+
